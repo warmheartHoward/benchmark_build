@@ -1,0 +1,30 @@
+# Benchmark 构建配置文件
+
+# 输入路径
+excel_path: "path/to/your/input.xlsx"       # Excel文件路径
+video_root: "path/to/your/video_root"        # 视频文件夹根目录
+
+# 输出路径
+output_dir: "./output"                        # 输出目录
+frames_dir: "./output/frames"                 # 抽帧图片保存目录
+selected_dir: "./output/selected"             # 被选中的最佳帧保存目录
+benchmark_tsv: "./output/benchmark.tsv"       # 最终输出的TSV文件
+
+# 抽帧配置
+frame_extraction:
+  fps: 1                                      # 抽帧帧率，每秒抽取几帧
+  max_frames: 30                              # 每个视频最多抽取帧数
+  image_format: "jpg"                         # 抽帧图片格式
+  quality: 95                                 # JPEG质量 (1-100)
+
+# Gemini API 配置 (OpenAI兼容接口)
+api:
+  base_url: "https://your-api-endpoint/v1"    # OpenAI兼容接口的base_url
+  api_key: "your-api-key"                     # API Key
+  model: "gemini-2.0-flash-lite"              # 模型名称
+  max_tokens: 1024                            # 最大输出token数
+  batch_size: 5                               # 每次发送给API的图片数量
+
+# QA生成配置
+qa:
+  language: "zh"                              # 问题语言: zh/en
