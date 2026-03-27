@@ -79,16 +79,53 @@ def find_video_path(video_root: str, museum: str, video_name: str) -> str | None
     return None
 
 
+def _cv_read_video(video_path: str) -> cv2.VideoCapture:
+    """兼容中文路径的视频读取"""
+    cap = cv2.VideoCapture(video_path)
+    if not cap.isOpened():
+        # OpenCV 在 Windows 上不支持非ASCII路径，写入临时文件中转
+        import tempfile
+        with open(video_path, "rb") as stream:
+            raw = stream.read()
+        suffix = Path(video_path).suffix
+        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
+        tmp.write(raw)
+        tmp.close()
+        cap = cv2.VideoCapture(tmp.name)
+        cap._tmp_file = tmp.name  # 记录临时文件路径，后续清理
+    return cap
+
+
+def _cv_imwrite(path: str, img, params=None) -> bool:
+    """兼容中文路径的图片写入"""
+    if params is None:
+        params = []
+    # 先尝试直接写入
+    success = cv2.imwrite(path, img, params)
+    if not success:
+        # 编码后用 Python IO 写入，绕过 OpenCV 的路径限制
+        ext = Path(path).suffix
+        ret, buf = cv2.imencode(ext, img, params)
+        if ret:
+            with open(path, "wb") as f:
+                f.write(buf.tobytes())
+            success = True
+    return success
+
+
 def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
                    max_frames: int = 30, img_format: str = "jpg", quality: int = 95) -> list[str]:
     """从视频中按指定fps抽帧，返回帧图片路径列表"""
-    cap = cv2.VideoCapture(video_path)
+    logger.info(f"正在打开视频: {video_path}")
+    cap = _cv_read_video(video_path)
     if not cap.isOpened():
         logger.error(f"无法打开视频: {video_path}")
+        logger.error("请确认已安装视频编解码器，或尝试: pip install opencv-python-headless")
         return []
 
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    logger.info(f"视频信息: fps={video_fps}, 总帧数={total_frames}")
     if video_fps <= 0 or total_frames <= 0:
         logger.error(f"视频信息异常: {video_path} (fps={video_fps}, frames={total_frames})")
         cap.release()
@@ -96,6 +133,7 @@ def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
 
     # 计算抽帧间隔
     frame_interval = max(1, int(video_fps / fps))
+    logger.info(f"抽帧间隔: 每 {frame_interval} 帧取1帧 (目标fps={fps})")
     os.makedirs(output_dir, exist_ok=True)
 
     frame_paths = []
@@ -110,13 +148,21 @@ def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
             fname = f"frame_{frame_idx:06d}.{img_format}"
             fpath = os.path.join(output_dir, fname)
             encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality] if img_format == "jpg" else []
-            cv2.imwrite(fpath, frame, encode_params)
-            frame_paths.append(fpath)
-            saved_count += 1
+            success = _cv_imwrite(fpath, frame, encode_params)
+            if success:
+                frame_paths.append(fpath)
+                saved_count += 1
+            else:
+                logger.warning(f"写入帧失败: {fpath}")
         frame_idx += 1
 
+    # 清理临时文件
+    tmp_file = getattr(cap, "_tmp_file", None)
     cap.release()
-    logger.info(f"从 {video_path} 抽取 {len(frame_paths)} 帧")
+    if tmp_file and os.path.exists(tmp_file):
+        os.unlink(tmp_file)
+
+    logger.info(f"从 {video_path} 抽取 {len(frame_paths)} 帧 -> {output_dir}")
     return frame_paths
 
 
