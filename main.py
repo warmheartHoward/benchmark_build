@@ -733,13 +733,20 @@ def main():
                     logger.error(f"处理失败 {entry['museum']}/{entry['video']}: {e}")
                 pbar.update(1)
 
-    # 5. 输出TSV
+    # 5. 结果去重：同一 museum/video/gt 只保留最新一条
+    seen_keys = {}
+    for r in results:
+        key = f"{r['museum']}/{r['source_video']}"
+        seen_keys[key] = r  # 后出现的覆盖先出现的
+    results = list(seen_keys.values())
+
+    # 6. 输出TSV
     if results:
         write_benchmark_tsv(results, output_tsv)
     else:
         logger.warning("没有生成任何benchmark条目")
 
-    # 6. 回写Excel并输出统计
+    # 7. 回写Excel并输出统计
     write_back_excel(excel_path, results)
 
     logger.info(f"完成! 共生成 {len(results)} 条benchmark条目")
