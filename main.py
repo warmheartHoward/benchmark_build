@@ -101,20 +101,16 @@ def _cv_read_video(video_path: str) -> cv2.VideoCapture:
 
 
 def _cv_imwrite(path: str, img, params=None) -> bool:
-    """兼容中文路径的图片写入"""
+    """兼容中文路径的图片写入，始终用 Python IO 绕过 OpenCV 路径限制"""
     if params is None:
         params = []
-    # 先尝试直接写入
-    success = cv2.imwrite(path, img, params)
-    if not success:
-        # 编码后用 Python IO 写入，绕过 OpenCV 的路径限制
-        ext = Path(path).suffix
-        ret, buf = cv2.imencode(ext, img, params)
-        if ret:
-            with open(path, "wb") as f:
-                f.write(buf.tobytes())
-            success = True
-    return success
+    ext = Path(path).suffix or ".jpg"
+    ret, buf = cv2.imencode(ext, img, params)
+    if ret:
+        with open(path, "wb") as f:
+            f.write(buf.tobytes())
+        return True
+    return False
 
 
 def _calc_blur_score(frame) -> float:
