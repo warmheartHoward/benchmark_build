@@ -60,17 +60,20 @@ def find_video_path(video_root: str, museum: str, video_name: str) -> str | None
             logger.warning(f"未找到博物馆文件夹: {museum}")
             return None
 
-    # 精确匹配视频文件名
-    video_path = museum_dir / video_name
-    if video_path.exists():
-        return str(video_path)
-
-    # 尝试不带扩展名匹配
-    for f in museum_dir.iterdir():
-        if f.is_file() and f.stem == Path(video_name).stem:
-            return str(f)
-        if f.is_file() and video_name in f.name:
-            return str(f)
+    # 递归搜索博物馆文件夹及所有子文件夹
+    video_stem = Path(video_name).stem
+    for dirpath, _, filenames in os.walk(museum_dir):
+        for fname in filenames:
+            fpath = Path(dirpath) / fname
+            # 精确匹配文件名
+            if fname == video_name:
+                return str(fpath)
+            # 不带扩展名匹配
+            if fpath.stem == video_stem:
+                return str(fpath)
+            # 部分匹配
+            if video_name in fname:
+                return str(fpath)
 
     logger.warning(f"未找到视频: {museum}/{video_name}")
     return None
