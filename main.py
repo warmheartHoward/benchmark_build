@@ -692,6 +692,13 @@ def main():
         logger.error("没有有效的数据条目")
         sys.exit(1)
 
+    # 按博物馆过滤
+    museum_filter = cfg.get("museums")
+    if museum_filter:
+        museum_set = set(museum_filter)
+        entries = [e for e in entries if e["museum"] in museum_set]
+        logger.info(f"博物馆过滤: {museum_filter} -> {len(entries)} 条")
+
     # 断点续传：从已有TSV中读取已完成的条目
     done_set: set[str] = set()
     done_lock = threading.Lock()
