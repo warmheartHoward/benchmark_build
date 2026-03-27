@@ -6,14 +6,18 @@ Benchmark Builder: 从博物馆视频构建单帧图像世界知识识别Benchma
 import os
 import sys
 import csv
+import json
 import yaml
 import base64
 import random
 import logging
 import argparse
 from pathlib import Path
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import threading
 
 import cv2
+import numpy as np
 import openpyxl
 from openai import OpenAI
 from tqdm import tqdm
@@ -113,15 +117,22 @@ def _cv_imwrite(path: str, img, params=None) -> bool:
     return success
 
 
+def _calc_blur_score(frame) -> float:
+    """计算图像模糊度分数（拉普拉斯方差），值越大越清晰"""
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+    return cv2.Laplacian(gray, cv2.CV_64F).var()
+
+
 def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
-                   max_frames: int = 30, img_format: str = "jpg", quality: int = 95) -> list[str]:
-    """从视频中按指定fps抽帧，返回帧图片路径列表"""
+                   max_frames: int = 30, img_format: str = "jpg", quality: int = 95,
+                   blur_threshold: float = 50.0) -> tuple[list[str], float]:
+    """从视频中按指定fps抽帧，自动过滤模糊帧，返回 (帧图片路径列表, 视频原始fps)"""
     logger.info(f"正在打开视频: {video_path}")
     cap = _cv_read_video(video_path)
     if not cap.isOpened():
         logger.error(f"无法打开视频: {video_path}")
         logger.error("请确认已安装视频编解码器，或尝试: pip install opencv-python-headless")
-        return []
+        return [], 0.0
 
     video_fps = cap.get(cv2.CAP_PROP_FPS)
     total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
@@ -129,32 +140,39 @@ def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
     if video_fps <= 0 or total_frames <= 0:
         logger.error(f"视频信息异常: {video_path} (fps={video_fps}, frames={total_frames})")
         cap.release()
-        return []
+        return [], 0.0
 
-    # 计算抽帧间隔
+    # 计算抽帧间隔和目标帧号列表
     frame_interval = max(1, int(video_fps / fps))
-    logger.info(f"抽帧间隔: 每 {frame_interval} 帧取1帧 (目标fps={fps})")
+    target_indices = [i * frame_interval for i in range(max_frames)
+                      if i * frame_interval < total_frames]
+    logger.info(f"计划抽取 {len(target_indices)} 帧 (间隔={frame_interval})")
     os.makedirs(output_dir, exist_ok=True)
 
     frame_paths = []
-    frame_idx = 0
-    saved_count = 0
+    skipped_blur = 0
 
-    while True:
+    for target_idx in target_indices:
+        # 直接 seek 到目标帧，避免逐帧读取
+        cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
         ret, frame = cap.read()
         if not ret:
-            break
-        if frame_idx % frame_interval == 0 and saved_count < max_frames:
-            fname = f"frame_{frame_idx:06d}.{img_format}"
-            fpath = os.path.join(output_dir, fname)
-            encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality] if img_format == "jpg" else []
-            success = _cv_imwrite(fpath, frame, encode_params)
-            if success:
-                frame_paths.append(fpath)
-                saved_count += 1
-            else:
-                logger.warning(f"写入帧失败: {fpath}")
-        frame_idx += 1
+            continue
+
+        # 本地模糊检测：过滤掉模糊帧，减少发给API的数量
+        blur_score = _calc_blur_score(frame)
+        if blur_score < blur_threshold:
+            skipped_blur += 1
+            continue
+
+        fname = f"frame_{target_idx:06d}.{img_format}"
+        fpath = os.path.join(output_dir, fname)
+        encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality] if img_format == "jpg" else []
+        success = _cv_imwrite(fpath, frame, encode_params)
+        if success:
+            frame_paths.append(fpath)
+        else:
+            logger.warning(f"写入帧失败: {fpath}")
 
     # 清理临时文件
     tmp_file = getattr(cap, "_tmp_file", None)
@@ -162,56 +180,68 @@ def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
     if tmp_file and os.path.exists(tmp_file):
         os.unlink(tmp_file)
 
-    logger.info(f"从 {video_path} 抽取 {len(frame_paths)} 帧 -> {output_dir}")
-    return frame_paths
+    logger.info(f"从 {video_path} 抽取 {len(frame_paths)} 帧, "
+                f"过滤模糊帧 {skipped_blur} 张 -> {output_dir}")
+    return frame_paths, video_fps
 
 
-def encode_image_base64(image_path: str) -> str:
+def encode_image_base64(image_path: str, max_long_edge: int = 1024) -> str:
+    """编码图片为base64，发送前缩小尺寸以加速API传输"""
+    img = cv2.imread(image_path)
+    if img is None:
+        # 中文路径回退
+        raw = Path(image_path).read_bytes()
+        img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    if img is not None:
+        h, w = img.shape[:2]
+        long_edge = max(h, w)
+        if long_edge > max_long_edge:
+            scale = max_long_edge / long_edge
+            img = cv2.resize(img, (int(w * scale), int(h * scale)),
+                             interpolation=cv2.INTER_AREA)
+        _, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 85])
+        return base64.b64encode(buf.tobytes()).decode("utf-8")
+    # 无法解码时直接读取原始文件
     with open(image_path, "rb") as f:
         return base64.b64encode(f.read()).decode("utf-8")
 
 
-def select_best_frame(client: OpenAI, model: str, frame_paths: list[str],
-                      gt_name: str, batch_size: int = 5, max_tokens: int = 1024) -> list[str]:
+def select_frames(client: OpenAI, model: str, frame_paths: list[str],
+                   gt_name: str, batch_size: int = 5,
+                   max_tokens: int = 1024) -> tuple[str | None, list[str]]:
     """
-    调用Gemini选出最适合作为benchmark的帧。
-    返回被选中的帧路径列表。
+    两阶段选帧：
+      阶段1 - 每批筛选出所有合格帧（可多张）
+      阶段2 - 从所有合格帧中用锦标赛选出唯一最佳帧
+    返回: (best_frame_path, all_good_frame_paths)
     """
     if not frame_paths:
-        return []
+        return None, []
 
-    selected_frames = []
-
-    # 分批发送图片
-    for batch_start in range(0, len(frame_paths), batch_size):
-        batch = frame_paths[batch_start:batch_start + batch_size]
+    def _ask_good_frames(candidates: list[str], round_name: str = "") -> list[str]:
+        """从一组候选帧中让Gemini筛选出所有合格帧"""
         content = [
             {
                 "type": "text",
                 "text": (
-                    f"你是一个benchmark数据集构建助手。以下是从一个关于「{gt_name}」的博物馆展品视频中抽取的 {len(batch)} 帧图像。\n"
-                    f"请从中选出最适合作为「单帧世界知识识别benchmark」的图像。\n\n"
-                    f"选择标准：\n"
+                    f"你是一个benchmark数据集构建助手。以下是从一个关于「{gt_name}」的博物馆展品视频中抽取的 {len(candidates)} 帧图像。\n"
+                    f"请筛选出所有适合作为「图像识别数据集」的图像。\n\n"
+                    f"筛选标准：\n"
                     f"1. 图像清晰，不模糊\n"
                     f"2. 没有运动拖影\n"
                     f"3. 没有铭牌/标签/文字说明牌遮挡主体\n"
-                    f"4. 展品主体完整可见，占据画面主要区域\n"
-                    f"5. 光线良好，色彩自然\n"
-                    f"6. 适合用于考察视觉识别能力（即仅凭图像内容就能辨认出是什么）\n\n"
-                    f"可以选择多张符合条件的图像。\n"
-                    f"请只返回被选中图像的编号（从1开始），用逗号分隔。例如：1,3,5\n"
-                    f"如果没有合适的图像，返回：无"
+                    f"4. 展品主体完整可见\n"
+                    f"5. 光线良好，色彩自然\n\n"
+                    f"请返回所有合格图像的编号（从1开始），用逗号分隔。例如：1,3,5\n"
+                    f"如果没有合格图像，返回：无"
                 )
             }
         ]
-        for i, fp in enumerate(batch):
+        for i, fp in enumerate(candidates):
             b64 = encode_image_base64(fp)
             ext = Path(fp).suffix.lstrip(".")
             mime = f"image/{ext}" if ext != "jpg" else "image/jpeg"
-            content.append({
-                "type": "text",
-                "text": f"图像 {i + 1}:"
-            })
+            content.append({"type": "text", "text": f"图像 {i + 1}:"})
             content.append({
                 "type": "image_url",
                 "image_url": {"url": f"data:{mime};base64,{b64}"}
@@ -224,32 +254,110 @@ def select_best_frame(client: OpenAI, model: str, frame_paths: list[str],
                 max_tokens=max_tokens,
             )
             answer = resp.choices[0].message.content.strip()
-            logger.info(f"API返回选帧结果: {answer}")
+            logger.info(f"API筛选结果{round_name}: {answer}")
 
             if "无" in answer:
-                continue
+                return []
 
-            # 解析选中的编号
+            selected = []
             for token in answer.replace("，", ",").split(","):
-                token = token.strip().rstrip("。.）)")
-                # 提取数字
                 num_str = "".join(c for c in token if c.isdigit())
                 if num_str:
                     idx = int(num_str) - 1
-                    if 0 <= idx < len(batch):
-                        selected_frames.append(batch[idx])
-
+                    if 0 <= idx < len(candidates):
+                        selected.append(candidates[idx])
+            return selected
         except Exception as e:
-            logger.error(f"API调用失败: {e}")
-            # 回退：选第一帧
-            if batch:
-                selected_frames.append(batch[0])
+            logger.error(f"API调用失败{round_name}: {e}")
+            return []
 
-    if not selected_frames and frame_paths:
-        logger.warning("未能选出合适帧，回退选取中间帧")
-        selected_frames.append(frame_paths[len(frame_paths) // 2])
+    def _ask_best_one(candidates: list[str], round_name: str = "") -> str | None:
+        """从一组候选帧中让Gemini选出最佳的1帧"""
+        content = [
+            {
+                "type": "text",
+                "text": (
+                    f"你是一个benchmark数据集构建助手。以下是从一个关于「{gt_name}」的博物馆展品视频中筛选出的 {len(candidates)} 帧合格图像。\n"
+                    f"请从中选出**最适合**作为「单帧世界知识识别benchmark测试题」的**唯一一张**图像。\n\n"
+                    f"选择标准（按优先级排序）：\n"
+                    f"1. 图像最清晰锐利\n"
+                    f"2. 展品主体占比最大、最完整\n"
+                    f"3. 没有任何文字/铭牌干扰\n"
+                    f"4. 最适合考察视觉识别能力（仅凭图像就能辨认出是什么）\n\n"
+                    f"请只返回最佳图像的编号（从1开始），只返回一个数字，不要解释。"
+                )
+            }
+        ]
+        for i, fp in enumerate(candidates):
+            b64 = encode_image_base64(fp)
+            ext = Path(fp).suffix.lstrip(".")
+            mime = f"image/{ext}" if ext != "jpg" else "image/jpeg"
+            content.append({"type": "text", "text": f"图像 {i + 1}:"})
+            content.append({
+                "type": "image_url",
+                "image_url": {"url": f"data:{mime};base64,{b64}"}
+            })
 
-    return selected_frames
+        try:
+            resp = client.chat.completions.create(
+                model=model,
+                messages=[{"role": "user", "content": content}],
+                max_tokens=max_tokens,
+            )
+            answer = resp.choices[0].message.content.strip()
+            logger.info(f"API选帧结果{round_name}: {answer}")
+
+            num_str = "".join(c for c in answer if c.isdigit())
+            if num_str:
+                idx = int(num_str) - 1
+                if 0 <= idx < len(candidates):
+                    return candidates[idx]
+        except Exception as e:
+            logger.error(f"API调用失败{round_name}: {e}")
+
+        return None
+
+    # ===== 阶段1：分批筛选所有合格帧 =====
+    all_good_frames = []
+    for batch_start in range(0, len(frame_paths), batch_size):
+        batch = frame_paths[batch_start:batch_start + batch_size]
+        good = _ask_good_frames(batch, f" [批次{batch_start // batch_size + 1}]")
+        all_good_frames.extend(good)
+
+    if not all_good_frames:
+        logger.warning("所有批次均未筛选出合格帧，回退选取中间帧")
+        fallback = frame_paths[len(frame_paths) // 2]
+        return fallback, [fallback]
+
+    logger.info(f"阶段1完成: 从 {len(frame_paths)} 帧中筛选出 {len(all_good_frames)} 帧合格")
+
+    # ===== 阶段2：锦标赛选出最佳1帧 =====
+    if len(all_good_frames) == 1:
+        return all_good_frames[0], all_good_frames
+
+    # 如果合格帧数量不多，直接一次PK
+    if len(all_good_frames) <= batch_size:
+        best = _ask_best_one(all_good_frames, " [决赛]")
+        if best:
+            return best, all_good_frames
+        return all_good_frames[0], all_good_frames
+
+    # 合格帧多时，分批PK再决赛
+    batch_winners = []
+    for batch_start in range(0, len(all_good_frames), batch_size):
+        batch = all_good_frames[batch_start:batch_start + batch_size]
+        winner = _ask_best_one(batch, f" [半决赛{batch_start // batch_size + 1}]")
+        if winner:
+            batch_winners.append(winner)
+
+    if not batch_winners:
+        return all_good_frames[0], all_good_frames
+
+    if len(batch_winners) == 1:
+        return batch_winners[0], all_good_frames
+
+    final = _ask_best_one(batch_winners, " [决赛]")
+    return (final or batch_winners[0]), all_good_frames
 
 
 def generate_question(gt_name: str, language: str = "zh") -> str:
@@ -306,18 +414,69 @@ def generate_question(gt_name: str, language: str = "zh") -> str:
         return random.choice(en_templates)
 
 
-def save_selected_frame(src_path: str, selected_dir: str, museum: str,
-                        gt_name: str, idx: int) -> str:
-    """将选中帧复制到selected目录，返回新路径"""
-    os.makedirs(selected_dir, exist_ok=True)
-    ext = Path(src_path).suffix
-    safe_name = gt_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
-    dst_name = f"{museum}_{safe_name}_{idx}{ext}"
-    dst_path = os.path.join(selected_dir, dst_name)
+def _extract_frame_timestamp(frame_path: str, video_fps: float) -> str:
+    """从帧文件名中提取帧号并转为时间戳字符串，如 '00m12s'"""
+    stem = Path(frame_path).stem  # e.g. "frame_000060"
+    num_str = "".join(c for c in stem if c.isdigit())
+    if num_str and video_fps > 0:
+        frame_idx = int(num_str)
+        total_sec = frame_idx / video_fps
+        minutes = int(total_sec // 60)
+        seconds = int(total_sec % 60)
+        return f"{minutes:02d}m{seconds:02d}s"
+    return "00m00s"
 
+
+def _make_filename(museum: str, video_name: str, timestamp: str, gt_name: str) -> str:
+    """生成标准文件名: 博物馆_视频名_帧时刻_文物名"""
+    safe_museum = museum.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    video_stem = Path(video_name).stem
+    safe_gt = gt_name.replace("/", "_").replace("\\", "_").replace(" ", "_")
+    return f"{safe_museum}_{video_stem}_{timestamp}_{safe_gt}"
+
+
+def save_selected_frame(src_path: str, dst_dir: str, museum: str, video_name: str,
+                        gt_name: str, video_fps: float, idx: int = 0) -> str:
+    """将选中帧复制到目标目录，文件名格式: 博物馆_视频名_帧时刻_文物名"""
     import shutil
+    os.makedirs(dst_dir, exist_ok=True)
+    ext = Path(src_path).suffix
+    timestamp = _extract_frame_timestamp(src_path, video_fps)
+    base_name = _make_filename(museum, video_name, timestamp, gt_name)
+    # 多帧时用后缀区分
+    suffix = f"_{idx}" if idx > 0 else ""
+    dst_path = os.path.join(dst_dir, f"{base_name}{suffix}{ext}")
     shutil.copy2(src_path, dst_path)
     return dst_path
+
+
+def save_frame_with_json(src_path: str, dst_dir: str, video_name: str,
+                         gt_name: str, video_fps: float, question: str,
+                         museum: str) -> str:
+    """保存最佳帧并生成同名JSON文件，返回图片路径"""
+    import shutil
+    os.makedirs(dst_dir, exist_ok=True)
+    ext = Path(src_path).suffix
+    timestamp = _extract_frame_timestamp(src_path, video_fps)
+    base_name = _make_filename(museum, video_name, timestamp, gt_name)
+
+    img_path = os.path.join(dst_dir, f"{base_name}{ext}")
+    json_path = os.path.join(dst_dir, f"{base_name}.json")
+
+    shutil.copy2(src_path, img_path)
+
+    qa_data = {
+        "image": f"{base_name}{ext}",
+        "question": question,
+        "answer": gt_name,
+        "museum": museum,
+        "source_video": video_name,
+        "timestamp": timestamp,
+    }
+    with open(json_path, "w", encoding="utf-8") as f:
+        json.dump(qa_data, f, ensure_ascii=False, indent=2)
+
+    return img_path
 
 
 def write_benchmark_tsv(results: list[dict], output_path: str):
@@ -337,6 +496,84 @@ def write_benchmark_tsv(results: list[dict], output_path: str):
     logger.info(f"Benchmark已保存: {output_path} ({len(results)} 条)")
 
 
+def process_single_entry(entry: dict, *, video_root: str, frames_dir: str,
+                         selected_dir: str, fps: float, max_frames: int,
+                         img_format: str, quality: int, blur_threshold: float,
+                         client: OpenAI | None, api_cfg: dict, language: str,
+                         dry_run: bool, done_set: set | None = None,
+                         done_lock: threading.Lock | None = None) -> list[dict]:
+    """处理单个视频条目，返回该视频生成的benchmark结果列表（线程安全）"""
+    museum = entry["museum"]
+    video_name = entry["video"]
+    gt = entry["gt"]
+
+    # 断点续传：跳过已处理的条目
+    entry_key = f"{museum}/{video_name}"
+    if done_set is not None and entry_key in done_set:
+        logger.info(f"跳过已处理: {entry_key}")
+        return []
+
+    # 1. 查找视频
+    video_path = find_video_path(video_root, museum, video_name)
+    if not video_path:
+        return []
+
+    # 2. 抽帧
+    video_frame_dir = os.path.join(frames_dir, museum, Path(video_name).stem)
+    frame_paths, video_fps = extract_frames(
+        video_path, video_frame_dir,
+        fps=fps, max_frames=max_frames,
+        img_format=img_format, quality=quality,
+        blur_threshold=blur_threshold
+    )
+    if not frame_paths:
+        logger.warning(f"抽帧失败: {video_path}")
+        return []
+
+    # 3. 选帧
+    if dry_run:
+        best_frame = frame_paths[len(frame_paths) // 2]
+        all_good_frames = frame_paths
+        logger.info(f"[dry-run] 选择中间帧: {best_frame}")
+    else:
+        best_frame, all_good_frames = select_frames(
+            client, api_cfg["model"], frame_paths, gt,
+            batch_size=api_cfg.get("batch_size", 5),
+            max_tokens=api_cfg.get("max_tokens", 1024),
+        )
+
+    if not best_frame:
+        logger.warning(f"未能选出合适帧: {museum}/{video_name}")
+        return []
+
+    # 4a. 保存最佳帧 + 同名JSON 到 benchmark 目录
+    question = generate_question(gt, language)
+    saved_best = save_frame_with_json(
+        best_frame, selected_dir, video_name, gt, video_fps,
+        question=question, museum=museum,
+    )
+    entry_results = [{
+        "image_path": saved_best,
+        "question": question,
+        "answer": gt,
+        "museum": museum,
+        "source_video": video_name,
+    }]
+
+    # 4b. 保存所有合格帧到 candidates 目录（可用于训练等）
+    candidates_dir = os.path.join(os.path.dirname(selected_dir), "candidates", museum)
+    for i, fp in enumerate(all_good_frames):
+        save_selected_frame(fp, candidates_dir, museum, video_name, gt, video_fps, idx=i)
+    logger.info(f"保存 {len(all_good_frames)} 张合格帧 -> {candidates_dir}")
+
+    # 标记已完成，用于断点续传
+    if done_set is not None and done_lock is not None:
+        with done_lock:
+            done_set.add(entry_key)
+
+    return entry_results
+
+
 def main():
     parser = argparse.ArgumentParser(description="博物馆视频Benchmark构建工具")
     parser.add_argument("--config", default="config.yaml", help="配置文件路径")
@@ -344,6 +581,7 @@ def main():
     parser.add_argument("--video-root", default=None, help="视频根目录（覆盖配置）")
     parser.add_argument("--output", default=None, help="输出TSV路径（覆盖配置）")
     parser.add_argument("--dry-run", action="store_true", help="只抽帧不调API")
+    parser.add_argument("--workers", type=int, default=None, help="并行线程数（覆盖配置）")
     args = parser.parse_args()
 
     cfg = load_config(args.config)
@@ -359,10 +597,12 @@ def main():
     max_frames = fc.get("max_frames", 30)
     img_format = fc.get("image_format", "jpg")
     quality = fc.get("quality", 95)
+    blur_threshold = fc.get("blur_threshold", 50.0)
 
     api_cfg = cfg.get("api", {})
     qa_cfg = cfg.get("qa", {})
     language = qa_cfg.get("language", "zh")
+    max_workers = args.workers or cfg.get("max_workers", 4)
 
     # 初始化API客户端
     client = None
@@ -378,51 +618,46 @@ def main():
         logger.error("没有有效的数据条目")
         sys.exit(1)
 
+    # 断点续传：从已有TSV中读取已完成的条目
+    done_set: set[str] = set()
+    done_lock = threading.Lock()
     results = []
+    if os.path.exists(output_tsv):
+        with open(output_tsv, "r", encoding="utf-8") as f:
+            reader = csv.DictReader(f, delimiter="\t")
+            for row in reader:
+                done_set.add(f"{row['museum']}/{row['source_video']}")
+                results.append(row)
+        logger.info(f"断点续传: 已有 {len(done_set)} 条已处理记录，跳过这些视频")
 
-    for entry in tqdm(entries, desc="处理视频"):
-        museum = entry["museum"]
-        video_name = entry["video"]
-        gt = entry["gt"]
+    results_lock = threading.Lock()
 
-        # 1. 查找视频
-        video_path = find_video_path(video_root, museum, video_name)
-        if not video_path:
-            continue
+    common_kwargs = dict(
+        video_root=video_root, frames_dir=frames_dir, selected_dir=selected_dir,
+        fps=fps, max_frames=max_frames, img_format=img_format, quality=quality,
+        blur_threshold=blur_threshold, client=client, api_cfg=api_cfg,
+        language=language, dry_run=args.dry_run,
+        done_set=done_set, done_lock=done_lock,
+    )
 
-        # 2. 抽帧
-        video_frame_dir = os.path.join(frames_dir, museum, Path(video_name).stem)
-        frame_paths = extract_frames(
-            video_path, video_frame_dir,
-            fps=fps, max_frames=max_frames,
-            img_format=img_format, quality=quality
-        )
-        if not frame_paths:
-            logger.warning(f"抽帧失败: {video_path}")
-            continue
+    logger.info(f"启动 {max_workers} 个工作线程处理 {len(entries)} 个视频")
 
-        # 3. 选帧
-        if args.dry_run:
-            selected = [frame_paths[len(frame_paths) // 2]]
-            logger.info(f"[dry-run] 选择中间帧: {selected[0]}")
-        else:
-            selected = select_best_frame(
-                client, api_cfg["model"], frame_paths, gt,
-                batch_size=api_cfg.get("batch_size", 5),
-                max_tokens=api_cfg.get("max_tokens", 1024),
-            )
-
-        # 4. 保存选中帧 + 生成QA
-        for i, frame_path in enumerate(selected):
-            saved_path = save_selected_frame(frame_path, selected_dir, museum, gt, i)
-            question = generate_question(gt, language)
-            results.append({
-                "image_path": saved_path,
-                "question": question,
-                "answer": gt,
-                "museum": museum,
-                "source_video": video_name,
-            })
+    with ThreadPoolExecutor(max_workers=max_workers) as executor:
+        future_to_entry = {
+            executor.submit(process_single_entry, entry, **common_kwargs): entry
+            for entry in entries
+        }
+        with tqdm(total=len(entries), desc="处理视频") as pbar:
+            for future in as_completed(future_to_entry):
+                entry = future_to_entry[future]
+                try:
+                    entry_results = future.result()
+                    if entry_results:
+                        with results_lock:
+                            results.extend(entry_results)
+                except Exception as e:
+                    logger.error(f"处理失败 {entry['museum']}/{entry['video']}: {e}")
+                pbar.update(1)
 
     # 5. 输出TSV
     if results:
@@ -430,7 +665,7 @@ def main():
     else:
         logger.warning("没有生成任何benchmark条目")
 
-    logger.info("完成!")
+    logger.info(f"完成! 共生成 {len(results)} 条benchmark条目")
 
 
 if __name__ == "__main__":

@@ -7,7 +7,8 @@ video_root: "path/to/your/video_root"        # 视频文件夹根目录
 # 输出路径
 output_dir: "./output"                        # 输出目录
 frames_dir: "./output/frames"                 # 抽帧图片保存目录
-selected_dir: "./output/selected"             # 被选中的最佳帧保存目录
+selected_dir: "./output/selected"             # 最佳帧保存目录（写入TSV）
+# candidates 目录自动生成在 output/candidates/   # 所有合格帧保存目录（可用于训练）
 benchmark_tsv: "./output/benchmark.tsv"       # 最终输出的TSV文件
 
 # 抽帧配置
@@ -16,6 +17,7 @@ frame_extraction:
   max_frames: 30                              # 每个视频最多抽取帧数
   image_format: "jpg"                         # 抽帧图片格式
   quality: 95                                 # JPEG质量 (1-100)
+  blur_threshold: 50.0                        # 模糊度阈值，低于此值的帧自动过滤（拉普拉斯方差）
 
 # Gemini API 配置 (OpenAI兼容接口)
 api:
@@ -24,6 +26,9 @@ api:
   model: "gemini-2.0-flash-lite"              # 模型名称
   max_tokens: 1024                            # 最大输出token数
   batch_size: 5                               # 每次发送给API的图片数量
+
+# 并行配置
+max_workers: 4                                # 并行线程数
 
 # QA生成配置
 qa:
