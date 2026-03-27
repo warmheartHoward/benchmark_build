@@ -12,6 +12,8 @@ import base64
 import random
 import logging
 import argparse
+import subprocess
+import shutil
 from pathlib import Path
 from concurrent.futures import ThreadPoolExecutor, as_completed
 import threading
@@ -83,34 +85,34 @@ def find_video_path(video_root: str, museum: str, video_name: str) -> str | None
     return None
 
 
-def _cv_read_video(video_path: str) -> cv2.VideoCapture:
-    """兼容中文路径的视频读取"""
-    cap = cv2.VideoCapture(video_path)
-    if not cap.isOpened():
-        # OpenCV 在 Windows 上不支持非ASCII路径，写入临时文件中转
-        import tempfile
-        with open(video_path, "rb") as stream:
-            raw = stream.read()
-        suffix = Path(video_path).suffix
-        tmp = tempfile.NamedTemporaryFile(delete=False, suffix=suffix)
-        tmp.write(raw)
-        tmp.close()
-        cap = cv2.VideoCapture(tmp.name)
-        cap._tmp_file = tmp.name  # 记录临时文件路径，后续清理
-    return cap
+def _get_video_info(video_path: str) -> tuple[float, int]:
+    """用 ffprobe 获取视频 fps 和总帧数"""
+    cmd = [
+        "ffprobe", "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=r_frame_rate,nb_frames,duration",
+        "-of", "json",
+        video_path,
+    ]
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
+    if result.returncode != 0:
+        logger.error(f"ffprobe 失败: {result.stderr.strip()}")
+        return 0.0, 0
+    info = json.loads(result.stdout)
+    stream = info.get("streams", [{}])[0]
+    # fps: "30/1" or "30000/1001"
+    r_rate = stream.get("r_frame_rate", "0/1")
+    num, den = map(int, r_rate.split("/"))
+    video_fps = num / den if den else 0.0
+    # 总帧数
+    nb = stream.get("nb_frames", "0")
+    if nb and nb != "N/A":
+        total_frames = int(nb)
+    else:
+        dur = float(stream.get("duration", 0))
+        total_frames = int(dur * video_fps)
+    return video_fps, total_frames
 
-
-def _cv_imwrite(path: str, img, params=None) -> bool:
-    """兼容中文路径的图片写入，始终用 Python IO 绕过 OpenCV 路径限制"""
-    if params is None:
-        params = []
-    ext = Path(path).suffix or ".jpg"
-    ret, buf = cv2.imencode(ext, img, params)
-    if ret:
-        with open(path, "wb") as f:
-            f.write(buf.tobytes())
-        return True
-    return False
 
 
 def _calc_blur_score(frame) -> float:
@@ -122,59 +124,66 @@ def _calc_blur_score(frame) -> float:
 def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
                    max_frames: int = 30, img_format: str = "jpg", quality: int = 95,
                    blur_threshold: float = 50.0) -> tuple[list[str], float]:
-    """从视频中按指定fps抽帧，自动过滤模糊帧，返回 (帧图片路径列表, 视频原始fps)"""
+    """用 ffmpeg 从视频中按指定fps抽帧，自动过滤模糊帧，返回 (帧图片路径列表, 视频原始fps)"""
     logger.info(f"正在打开视频: {video_path}")
-    cap = _cv_read_video(video_path)
-    if not cap.isOpened():
-        logger.error(f"无法打开视频: {video_path}")
-        logger.error("请确认已安装视频编解码器，或尝试: pip install opencv-python-headless")
+
+    # 检查 ffmpeg 是否可用
+    if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
+        logger.error("未找到 ffmpeg/ffprobe，请先安装: https://ffmpeg.org/download.html")
         return [], 0.0
 
-    video_fps = cap.get(cv2.CAP_PROP_FPS)
-    total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    video_fps, total_frames = _get_video_info(video_path)
     logger.info(f"视频信息: fps={video_fps}, 总帧数={total_frames}")
     if video_fps <= 0 or total_frames <= 0:
         logger.error(f"视频信息异常: {video_path} (fps={video_fps}, frames={total_frames})")
-        cap.release()
         return [], 0.0
 
-    # 计算抽帧间隔和目标帧号列表
-    frame_interval = max(1, int(video_fps / fps))
-    target_indices = [i * frame_interval for i in range(max_frames)
-                      if i * frame_interval < total_frames]
-    logger.info(f"计划抽取 {len(target_indices)} 帧 (间隔={frame_interval})")
     os.makedirs(output_dir, exist_ok=True)
 
+    # 计算抽帧间隔，用于生成与原来一致的帧号命名
+    frame_interval = max(1, int(video_fps / fps))
+    # ffmpeg 抽帧：输出文件名带序号，后续再重命名为帧号
+    tmp_pattern = os.path.join(output_dir, "_tmp_%06d." + img_format)
+    q_args = ["-q:v", "2"] if img_format == "jpg" else []
+    cmd = [
+        "ffmpeg", "-v", "error", "-y",
+        "-i", video_path,
+        "-vf", f"fps={fps}",
+        "-frames:v", str(max_frames),
+        *q_args,
+        tmp_pattern,
+    ]
+    logger.info(f"ffmpeg 抽帧: fps={fps}, max_frames={max_frames}")
+    result = subprocess.run(cmd, capture_output=True, text=True, timeout=300)
+    if result.returncode != 0:
+        logger.error(f"ffmpeg 抽帧失败: {result.stderr.strip()}")
+        return [], video_fps
+
+    # 收集 ffmpeg 输出的临时文件，重命名为 frame_NNNNNN 格式并过滤模糊帧
     frame_paths = []
     skipped_blur = 0
 
-    for target_idx in target_indices:
-        # 直接 seek 到目标帧，避免逐帧读取
-        cap.set(cv2.CAP_PROP_POS_FRAMES, target_idx)
-        ret, frame = cap.read()
-        if not ret:
-            continue
+    for seq in range(1, max_frames + 1):
+        tmp_path = os.path.join(output_dir, f"_tmp_{seq:06d}.{img_format}")
+        if not os.path.exists(tmp_path):
+            break
 
-        # 本地模糊检测：过滤掉模糊帧，减少发给API的数量
-        blur_score = _calc_blur_score(frame)
-        if blur_score < blur_threshold:
-            skipped_blur += 1
-            continue
+        # 模糊检测
+        raw = Path(tmp_path).read_bytes()
+        img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+        if img is not None:
+            blur_score = _calc_blur_score(img)
+            if blur_score < blur_threshold:
+                skipped_blur += 1
+                os.unlink(tmp_path)
+                continue
 
-        fname = f"frame_{target_idx:06d}.{img_format}"
-        fpath = os.path.join(output_dir, fname)
-        encode_params = [cv2.IMWRITE_JPEG_QUALITY, quality] if img_format == "jpg" else []
-        success = _cv_imwrite(fpath, frame, encode_params)
-        if success:
-            frame_paths.append(fpath)
-        else:
-            logger.warning(f"写入帧失败: {fpath}")
-
-    # 清理临时文件
-    tmp_file = getattr(cap, "_tmp_file", None)
-    cap.release()
-    if tmp_file and os.path.exists(tmp_file):
-        os.unlink(tmp_file)
+        # 重命名为帧号格式，保持与 _extract_frame_timestamp 的兼容
+        target_idx = (seq - 1) * frame_interval
+        final_name = f"frame_{target_idx:06d}.{img_format}"
+        final_path = os.path.join(output_dir, final_name)
+        os.replace(tmp_path, final_path)
+        frame_paths.append(final_path)
 
     logger.info(f"从 {video_path} 抽取 {len(frame_paths)} 帧, "
                 f"过滤模糊帧 {skipped_blur} 张 -> {output_dir}")
@@ -490,6 +499,63 @@ def write_benchmark_tsv(results: list[dict], output_path: str):
     logger.info(f"Benchmark已保存: {output_path} ({len(results)} 条)")
 
 
+def write_back_excel(excel_path: str, results: list[dict]):
+    """将处理结果回写到原始Excel，新增 成功/数据路径/QA 三列"""
+    # 按 (museum, video) 建索引
+    result_map: dict[tuple[str, str], dict] = {}
+    for r in results:
+        key = (r["museum"], r["source_video"])
+        result_map[key] = r
+
+    wb = openpyxl.load_workbook(excel_path)
+    ws = wb.active
+
+    # 找到已有列数，追加3列表头
+    header_row = 1
+    max_col = ws.max_column
+    col_success = max_col + 1
+    col_path = max_col + 2
+    col_qa = max_col + 3
+    ws.cell(row=header_row, column=col_success, value="成功")
+    ws.cell(row=header_row, column=col_path, value="数据路径")
+    ws.cell(row=header_row, column=col_qa, value="QA")
+
+    # 遍历数据行回填
+    success_count = 0
+    fail_count = 0
+    for row_idx in range(2, ws.max_row + 1):
+        museum = str(ws.cell(row=row_idx, column=1).value or "").strip()
+        video = str(ws.cell(row=row_idx, column=2).value or "").strip()
+        if not museum or not video:
+            continue
+        key = (museum, video)
+        r = result_map.get(key)
+        if r:
+            ws.cell(row=row_idx, column=col_success, value=True)
+            ws.cell(row=row_idx, column=col_path, value=r.get("image_path", ""))
+            qa_text = f"Q: {r.get('question', '')}  A: {r.get('answer', '')}"
+            ws.cell(row=row_idx, column=col_qa, value=qa_text)
+            success_count += 1
+        else:
+            ws.cell(row=row_idx, column=col_success, value=False)
+            fail_count += 1
+
+    wb.save(excel_path)
+    wb.close()
+
+    # 统计日志
+    total = success_count + fail_count
+    rate = (success_count / total * 100) if total else 0
+    logger.info("=" * 50)
+    logger.info("处理统计:")
+    logger.info(f"  总条目数:   {total}")
+    logger.info(f"  成功生成QA: {success_count}")
+    logger.info(f"  未成功:     {fail_count}")
+    logger.info(f"  成功率:     {rate:.1f}%")
+    logger.info(f"  结果已回写: {excel_path}")
+    logger.info("=" * 50)
+
+
 def process_single_entry(entry: dict, *, video_root: str, frames_dir: str,
                          selected_dir: str, fps: float, max_frames: int,
                          img_format: str, quality: int, blur_threshold: float,
@@ -658,6 +724,9 @@ def main():
         write_benchmark_tsv(results, output_tsv)
     else:
         logger.warning("没有生成任何benchmark条目")
+
+    # 6. 回写Excel并输出统计
+    write_back_excel(excel_path, results)
 
     logger.info(f"完成! 共生成 {len(results)} 条benchmark条目")
 
