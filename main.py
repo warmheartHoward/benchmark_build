@@ -183,11 +183,9 @@ def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
 
 def encode_image_base64(image_path: str, max_long_edge: int = 1024) -> str:
     """编码图片为base64，发送前缩小尺寸以加速API传输"""
-    img = cv2.imread(image_path)
-    if img is None:
-        # 中文路径回退
-        raw = Path(image_path).read_bytes()
-        img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
+    # 用 Python IO 读取再 imdecode，避免 cv2.imread 不支持中文路径
+    raw = Path(image_path).read_bytes()
+    img = cv2.imdecode(np.frombuffer(raw, np.uint8), cv2.IMREAD_COLOR)
     if img is not None:
         h, w = img.shape[:2]
         long_edge = max(h, w)
