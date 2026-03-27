@@ -124,8 +124,8 @@ def _calc_blur_score(frame) -> float:
 def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
                    max_frames: int = 30, img_format: str = "jpg", quality: int = 95,
                    blur_threshold: float = 50.0) -> tuple[list[str], float]:
-    """用 ffmpeg 从视频中按指定fps抽帧，自动过滤模糊帧，返回 (帧图片路径列表, 视频原始fps)"""
-    logger.info(f"正在打开视频: {video_path}")
+    """用 ffmpeg 从视频中按指定fps抽帧，自动过滤模糊帧，返回 (帧图片路径列表, 视频原始fps)
+    如果 output_dir 里已有 frame_*.xxx 文件，直接复用，跳过抽帧。"""
 
     # 检查 ffmpeg 是否可用
     if not shutil.which("ffmpeg") or not shutil.which("ffprobe"):
@@ -133,8 +133,22 @@ def extract_frames(video_path: str, output_dir: str, fps: float = 1.0,
         return [], 0.0
 
     video_fps, total_frames = _get_video_info(video_path)
+    if video_fps <= 0:
+        logger.error(f"无法获取视频信息: {video_path}")
+        return [], 0.0
+
+    # 复用已有帧：如果目录里已有 frame_*.xxx 就跳过抽帧
+    existing = sorted(
+        p for p in Path(output_dir).glob(f"frame_*.{img_format}") if p.is_file()
+    )
+    if existing:
+        frame_paths = [str(p) for p in existing]
+        logger.info(f"复用已有 {len(frame_paths)} 帧: {output_dir}")
+        return frame_paths, video_fps
+
+    logger.info(f"正在打开视频: {video_path}")
     logger.info(f"视频信息: fps={video_fps}, 总帧数={total_frames}")
-    if video_fps <= 0 or total_frames <= 0:
+    if total_frames <= 0:
         logger.error(f"视频信息异常: {video_path} (fps={video_fps}, frames={total_frames})")
         return [], 0.0
 
